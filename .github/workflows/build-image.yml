@@ -1,0 +1,44 @@
+name* Build SAP CI/CD Runtime
+
+on:
+  wo*kflow_dispatch:
+
+permissions:
+  co*tents: read
+  packages: write
+
+env*
+  REGISTRY: ghcr.io
+
+jobs:
+
+  bui*d-image:
+
+    runs-on: ubuntu-late*t
+
+    steps:
+
+      - name: Check*ut Repository
+        uses: action*/checkout@v5
+
+      - name: Conver* Repository Name to Lowercase
+    *   id: repo
+        shell: bash
+  *     run: |
+          echo "name=$*GITHUB_REPOSITORY,,}" >> "$GITHUB_*UTPUT"
+
+      - name: Login to GHC*
+        uses: docker/login-action*v3
+        with:
+          registr*: ${{ env.REGISTRY }}
+          us*rname: ${{ github.actor }}
+       *  password: ${{ secrets.GITHUB_TOK*N }}
+
+      - name: Build and Push*Runtime Image
+        uses: docker*build-push-action@v6
+        with:*          context: .
+          fil*: ./Dockerfile
+          push: tru*
+          tags: |
+            ghc*.io/${{ steps.repo.outputs.name }}*1.0
+            ghcr.io/${{ steps.*epo.outputs.name }}:latest
