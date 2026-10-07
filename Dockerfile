@@ -4,9 +4,8 @@ RUN apt-get update && apt-get install -y \
     bash \
     curl \
     jq \
-    git \
-    python3 \
     unzip \
+    git \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
