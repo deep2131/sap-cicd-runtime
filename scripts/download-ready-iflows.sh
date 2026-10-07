@@ -1,140 +1,229 @@
 #!/usr/bin/env bash
-*set -euo pipefail
 
-echo "=========*=============================="
-ec*o "SAP ReadyForDeployment Artifact*Download"
-echo "==================*====================="
+set -euo pipefail
 
-required_v*rs=(
+echo "=================================================="
+echo "SAP CPI - ReadyForDeployment Artifact Downloader"
+echo "=================================================="
+
+# ---------------------------------------------
+# 1. Validate required environment variables
+# ---------------------------------------------
+
+required_vars=(
   SAP_TOKEN_URL
-  SAP_CLIENT_*D
+  SAP_CLIENT_ID
   SAP_CLIENT_SECRET
-  SAP_BASE_U*L
+  SAP_BASE_URL
 )
 
-for var in "${required_vars[@*}"; do
-  if [ -z "${!var:-}" ]; th*n
-    echo "ERROR: $var is not con*igured"
+for var in "${required_vars[@]}"; do
+
+  if [ -z "${!var:-}" ]; then
+    echo "ERROR: $var is not configured."
     exit 1
   fi
+
 done
 
-echo*"Environment validation passed."
+echo "Required configuration is available."
 
-* ---------------------------------*-------
-# Get OAuth token
-# ------*----------------------------------*
+
+# ---------------------------------------------
+# 2. Generate OAuth token
+# ---------------------------------------------
+
 echo
-echo "Getting SAP OAuth toke*..."
+echo "Generating SAP OAuth token..."
 
-TOKEN_RESPONSE=$(curl --fail*--silent --show-error \
-  --reques* POST \
+TOKEN_RESPONSE=$(curl \
+  --fail \
+  --silent \
+  --show-error \
+  --request POST \
   "$SAP_TOKEN_URL" \
-  --u*er "$SAP_CLIENT_ID:$SAP_CLIENT_SEC*ET" \
-  --header "Content-Type: ap*lication/x-www-form-urlencoded" \
-* --data "grant_type=client_credent*als")
+  --user "$SAP_CLIENT_ID:$SAP_CLIENT_SECRET" \
+  --header "Content-Type: application/x-www-form-urlencoded" \
+  --data "grant_type=client_credentials")
 
-ACCESS_TOKEN=$(echo "$TOKEN*RESPONSE" | jq -r '.access_token /* empty')
+ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
 
-if [ -z "$ACCESS_TOKEN" *; then
-  echo "ERROR: Access token*was not returned."
+if [ -z "$ACCESS_TOKEN" ]; then
+
+  echo "ERROR: Access token was not returned."
   exit 1
+
 fi
 
-ec*o "Token generated successfully."
-*# --------------------------------*--------
-# Get design-time artifac*s
-# ------------------------------*----------
+echo "OAuth token generated successfully."
+
+
+# ---------------------------------------------
+# 3. Get design-time artifacts from CPI
+# ---------------------------------------------
 
 echo
-echo "Getting CPI*design-time artifacts..."
+echo "Reading CPI design-time artifacts..."
 
-RESPONS*=$(curl --fail --silent --show-err*r \
-  --header "Authorization: Bea*er ${ACCESS_TOKEN}" \
-  --header "*ccept: application/json" \
-  "${SA*_BASE_URL}/api/v1/IntegrationDesig*timeArtifacts?\$format=json")
+ARTIFACT_RESPONSE=$(curl \
+  --fail \
+  --silent \
+  --show-error \
+  --header "Authorization: Bearer ${ACCESS_TOKEN}" \
+  --header "Accept: application/json" \
+  "${SAP_BASE_URL}/api/v1/IntegrationDesigntimeArtifacts?\$format=json")
 
-# -*----------------------------------*----
-# Find Version = ReadyForDepl*yment
-# --------------------------*--------------
+
+# ---------------------------------------------
+# 4. Find versions ending ReadyForDeployment
+# ---------------------------------------------
 
 echo
-echo "Searchi*g for Version = ReadyForDeployment*.."
+echo "Searching for versions ending with:"
+echo ".ReadyForDeployment"
 
-READY_ARTIFACTS=$(echo "$RESP*NSE" | jq -c \
-  '.d.results[] | s*lect(.Version == "ReadyForDeployme*t")')
+READY_ARTIFACTS=$(echo "$ARTIFACT_RESPONSE" | \
+  jq -c '
+    .d.results[]
+    | select(
+        .Version != null
+        and (.Version | endswith(".ReadyForDeployment"))
+      )
+  ')
 
-if [ -z "$READY_ARTIFACTS" *; then
+
+# ---------------------------------------------
+# 5. Nothing found
+# ---------------------------------------------
+
+if [ -z "$READY_ARTIFACTS" ]; then
+
   echo
-  echo "No artifacts*with Version=ReadyForDeployment fo*nd."
+  echo "No ReadyForDeployment artifacts found."
+  echo
+  echo "Nothing to download."
+
   exit 0
+
 fi
 
-mkdir -p artifac*s
+
+# ---------------------------------------------
+# 6. Create destination folder
+# ---------------------------------------------
+
+mkdir -p artifacts
+
+
+# ---------------------------------------------
+# 7. Download matching artifacts
+# ---------------------------------------------
 
 COUNT=0
 
-# --------------------*--------------------
-# Download ev*ry matching artifact
-# -----------*-----------------------------
-
-whi*e IFS= read -r artifact
+while IFS= read -r artifact
 do
 
-  [ -z*"$artifact" ] && continue
+  [ -z "$artifact" ] && continue
 
-  ID=$(*cho "$artifact" | jq -r '.Id')
-  V*RSION=$(echo "$artifact" | jq -r '*Version')
-  NAME=$(echo "$artifact* | jq -r '.Name // .Id')
-  PACKAGE*ID=$(echo "$artifact" | jq -r '.Pa*kageId // "unknown"')
+  ID=$(echo "$artifact" | jq -r '.Id')
+  VERSION=$(echo "$artifact" | jq -r '.Version')
+  NAME=$(echo "$artifact" | jq -r '.Name // .Id')
 
   echo
-  ec*o "-------------------------------*--------"
-  echo "Artifact : $NAME*
-  echo "ID       : $ID"
-  echo "P*ckage  : $PACKAGE_ID"
-  echo "Vers*on  : $VERSION"
-  echo "----------*-----------------------------"
+  echo "=================================================="
+  echo "Ready artifact found"
+  echo "=================================================="
+  echo "Name    : $NAME"
+  echo "ID      : $ID"
+  echo "Version : $VERSION"
 
-  *OWNLOAD_URL="${SAP_BASE_URL}/api/v*/IntegrationDesigntimeArtifacts(Id*'${ID}',Version='${VERSION}')/\$va*ue"
 
-  OUTPUT_FILE="artifacts/${ID*.zip"
+  # Escape single quotes for OData string keys
+  SAFE_ID=${ID//\'/\'\'}
+  SAFE_VERSION=${VERSION//\'/\'\'}
 
-  HTTP_CODE=$(curl --silent*\
+  DOWNLOAD_URL="${SAP_BASE_URL}/api/v1/IntegrationDesigntimeArtifacts(Id='${SAFE_ID}',Version='${SAFE_VERSION}')/\$value"
+
+  OUTPUT_FILE="artifacts/${ID}.zip"
+
+  echo
+  echo "Downloading $ID..."
+
+  HTTP_CODE=$(curl \
+    --silent \
     --show-error \
-    --locatio* \
+    --location \
     --output "$OUTPUT_FILE" \
- *  --write-out "%{http_code}" \
-   *--header "Authorization: Bearer ${*CCESS_TOKEN}" \
-    "$DOWNLOAD_URL*)
+    --write-out "%{http_code}" \
+    --header "Authorization: Bearer ${ACCESS_TOKEN}" \
+    "$DOWNLOAD_URL")
 
-  if [ "$HTTP_CODE" != "200" ];*then
-    echo "ERROR: Download fai*ed for $ID"
-    echo "HTTP status:*$HTTP_CODE"
 
-    rm -f "$OUTPUT_FI*E"
+  if [ "$HTTP_CODE" != "200" ]; then
+
+    echo "ERROR: Download failed."
+    echo "Artifact: $ID"
+    echo "HTTP status: $HTTP_CODE"
+
+    rm -f "$OUTPUT_FILE"
+
     exit 1
+
   fi
 
-  if [ ! -s "$*UTPUT_FILE" ]; then
-    echo "ERRO*: Downloaded artifact is empty: $I*"
+
+  # -----------------------------------------
+  # 8. Verify file exists
+  # -----------------------------------------
+
+  if [ ! -s "$OUTPUT_FILE" ]; then
+
+    echo "ERROR: Downloaded file is empty."
+    echo "Artifact: $ID"
+
     exit 1
+
   fi
 
-  echo "Downloa* successful."
 
-  echo "Validating *IP..."
+  # -----------------------------------------
+  # 9. Verify ZIP
+  # -----------------------------------------
 
-  unzip -t "$OUTPUT_FILE"
-*  COUNT=$((COUNT + 1))
+  echo "Validating ZIP..."
 
-done <<< "*READY_ARTIFACTS"
+  if ! unzip -t "$OUTPUT_FILE" >/dev/null; then
 
+    echo "ERROR: Downloaded artifact is not a valid ZIP."
+    echo "Artifact: $ID"
+
+    exit 1
+
+  fi
+
+
+  echo "SUCCESS: $ID downloaded."
+
+  COUNT=$((COUNT + 1))
+
+done <<< "$READY_ARTIFACTS"
+
+
+# ---------------------------------------------
+# 10. Final summary
+# ---------------------------------------------
 
 echo
-echo "====*==================================*"
-echo "DOWNLOAD COMPLETE"
-echo "A*tifacts downloaded: $COUNT"
-echo "*==================================*===="
+echo "=================================================="
+echo "DOWNLOAD COMPLETED"
+echo "=================================================="
 
-find artifacts -type f -max*epth 2 -print
+echo "Artifacts downloaded: $COUNT"
+
+echo
+echo "Downloaded files:"
+
+find artifacts -maxdepth 1 -type f -name "*.zip" -print
+
+echo "=================================================="
