@@ -3,12 +3,8 @@
 set -euo pipefail
 
 echo "=================================================="
-echo "SAP CPI - ReadyForDeployment Artifact Downloader"
+echo "SAP CPI - ReadyForDeployment Downloader"
 echo "=================================================="
-
-# ==================================================
-# 1. Validate required environment variables
-# ==================================================
 
 required_vars=(
   SAP_TOKEN_URL
@@ -17,41 +13,31 @@ required_vars=(
   SAP_BASE_URL
 )
 
-missing=0
-
 for var in "${required_vars[@]}"; do
   if [ -z "${!var:-}" ]; then
     echo "::error::$var is not configured."
-    missing=1
-  else
-    echo "$var is configured."
+    exit 1
   fi
 done
 
-if [ "$missing" -ne 0 ]; then
-  echo "::error::Required SAP configuration is missing."
-  exit 1
-fi
+API_BASE="${SAP_BASE_URL%/}"
+API_BASE="${API_BASE%/api/v1}"
+
+WORKSPACE="${GITHUB_WORKSPACE:-$PWD}"
+DOWNLOAD_DIR="${WORKSPACE}/artifacts"
+TEMP_DIR="/tmp/cpi-download"
+
+VERSION_REGEX='^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?\.ReadyForDeployment$'
+
+mkdir -p "$DOWNLOAD_DIR"
+mkdir -p "$TEMP_DIR"
 
 echo
-echo "Required SAP configuration is available."
+echo "Output directory:"
+echo "$DOWNLOAD_DIR"
 
 # ==================================================
-# 2. Normalize SAP base URL
-# ==================================================
-
-BASE_URL="${SAP_BASE_URL%/}"
-
-# Remove API paths if accidentally included in SAP_BASE_URL
-BASE_URL="${BASE_URL%/api/v1/IntegrationDesigntimeArtifacts}"
-BASE_URL="${BASE_URL%/api/v1}"
-
-echo
-echo "SAP base host:"
-echo "$BASE_URL"
-
-# ==================================================
-# 3. Generate OAuth token
+# 1. Generate OAuth token
 # ==================================================
 
 echo
@@ -62,7 +48,7 @@ TOKEN_HTTP_CODE=$(curl \
   --show-error \
   --location \
   --request POST \
-  --output /tmp/sap-token-response.json \
+  --output "${TEMP_DIR}/token.json" \
   --write-out "%{http_code}" \
   --user "${SAP_CLIENT_ID}:${SAP_CLIENT_SECRET}" \
   --header "Content-Type: application/x-www-form-urlencoded" \
@@ -73,346 +59,309 @@ echo "Token HTTP status: $TOKEN_HTTP_CODE"
 
 if [ "$TOKEN_HTTP_CODE" != "200" ]; then
   echo "::error::SAP OAuth token request failed."
-
-  echo
-  echo "SAP token response:"
-
-  if [ -s /tmp/sap-token-response.json ]; then
-    cat /tmp/sap-token-response.json
-  else
-    echo "SAP returned an empty response body."
-  fi
-
-  echo
+  cat "${TEMP_DIR}/token.json" || true
   exit 1
 fi
 
-ACCESS_TOKEN=$(jq -r '.access_token // empty' \
-  /tmp/sap-token-response.json)
+SAP_ACCESS_TOKEN=$(jq -r '.access_token // empty' \
+  "${TEMP_DIR}/token.json")
 
-if [ -z "$ACCESS_TOKEN" ]; then
-  echo "::error::Access token was not returned."
-
-  echo
-  echo "Token response:"
-  cat /tmp/sap-token-response.json
-
+if [ -z "$SAP_ACCESS_TOKEN" ]; then
+  echo "::error::SAP OAuth token is empty."
   exit 1
 fi
 
 echo "OAuth token generated successfully."
 
 # ==================================================
-# 4. Read CPI design-time artifacts
-#
-# Important:
-# Do not add ?$format=json here.
-# The same API previously returned HTTP 501 when
-# called with that query option.
+# 2. Helper for CPI GET requests
+# ==================================================
+
+cpi_get() {
+
+  local url="$1"
+  local output="$2"
+
+  curl \
+    --silent \
+    --show-error \
+    --location \
+    --write-out "%{http_code}" \
+    --request GET \
+    "$url" \
+    --header "Authorization: Bearer ${SAP_ACCESS_TOKEN}" \
+    --header "Accept: application/json" \
+    --output "$output"
+}
+
+# ==================================================
+# 3. Get Integration Packages
 # ==================================================
 
 echo
-echo "Reading CPI design-time artifacts..."
+echo "Fetching IntegrationPackages..."
 
-API_URL="${BASE_URL}/api/v1/IntegrationDesigntimeArtifacts"
+PACKAGES_FILE="${TEMP_DIR}/packages.json"
+
+HTTP_CODE=$(cpi_get \
+  "${API_BASE}/api/v1/IntegrationPackages?\$format=json" \
+  "$PACKAGES_FILE")
+
+echo "IntegrationPackages HTTP status: $HTTP_CODE"
+
+if [ "$HTTP_CODE" != "200" ]; then
+
+  echo "::error::Failed to fetch IntegrationPackages."
+
+  cat "$PACKAGES_FILE" || true
+
+  exit 1
+fi
+
+PACKAGE_COUNT=$(jq '.d.results | length' "$PACKAGES_FILE")
+
+echo "Packages discovered: $PACKAGE_COUNT"
+
+# ==================================================
+# 4. Discover artifacts package-by-package
+# ==================================================
+
+ALL_ARTIFACTS="${TEMP_DIR}/all-artifacts.json"
+
+echo '{"d":{"results":[]}}' > "$ALL_ARTIFACTS"
 
 echo
-echo "CPI API URL:"
-echo "$API_URL"
+echo "Discovering package artifacts..."
 
-ARTIFACT_HTTP_CODE=$(curl \
-  --silent \
-  --show-error \
-  --location \
-  --request GET \
-  --output /tmp/cpi-artifacts-response.txt \
-  --write-out "%{http_code}" \
-  --header "Authorization: Bearer ${ACCESS_TOKEN}" \
-  --header "Accept: application/json" \
-  "$API_URL")
+while IFS= read -r PKG_ID; do
 
-echo
-echo "Artifact API HTTP status: $ARTIFACT_HTTP_CODE"
+  [ -z "$PKG_ID" ] && continue
+  [ "$PKG_ID" = "null" ] && continue
 
-if [ "$ARTIFACT_HTTP_CODE" != "200" ]; then
-  echo
-  echo "=================================================="
-  echo "CPI DESIGN-TIME API CALL FAILED"
-  echo "=================================================="
+  ODATA_PKG_ID=$(printf '%s' "$PKG_ID" |
+    sed "s/'/''/g")
 
-  echo
-  echo "Requested URL:"
-  echo "$API_URL"
+  SAFE_PKG=$(printf '%s' "$PKG_ID" |
+    tr -cd '[:alnum:]_.-')
 
-  echo
-  echo "HTTP status:"
-  echo "$ARTIFACT_HTTP_CODE"
+  PKG_FILE="${TEMP_DIR}/pkg-${SAFE_PKG}.json"
 
-  echo
-  echo "SAP response:"
+  PACKAGE_URL="${API_BASE}/api/v1/IntegrationPackages('${ODATA_PKG_ID}')/IntegrationDesigntimeArtifacts?\$format=json"
 
-  if [ -s /tmp/cpi-artifacts-response.txt ]; then
-    cat /tmp/cpi-artifacts-response.txt
+  HTTP_CODE=$(cpi_get \
+    "$PACKAGE_URL" \
+    "$PKG_FILE")
+
+  if [ "$HTTP_CODE" = "200" ]; then
+
+    PKG_ARTIFACT_COUNT=$(jq '.d.results | length' "$PKG_FILE")
+
+    echo "$PKG_ID: $PKG_ARTIFACT_COUNT artifact(s)"
+
+    jq -s \
+      '{
+        d: {
+          results:
+            (
+              (.[0].d.results // [])
+              +
+              (.[1].d.results // [])
+            )
+        }
+      }' \
+      "$ALL_ARTIFACTS" \
+      "$PKG_FILE" \
+      > "${TEMP_DIR}/merged.json"
+
+    mv "${TEMP_DIR}/merged.json" "$ALL_ARTIFACTS"
+
   else
-    echo "SAP returned an empty response body."
+
+    echo "::warning::Package $PKG_ID skipped. HTTP $HTTP_CODE"
+
   fi
 
-  echo
-  exit 1
-fi
+done < <(jq -r '.d.results[]?.Id' "$PACKAGES_FILE")
 
-echo "CPI design-time API request completed successfully."
-
-# ==================================================
-# 5. Validate the returned JSON structure
-#
-# SAP OData V2 normally returns:
-# {
-#   "d": {
-#     "results": [...]
-#   }
-# }
-#
-# The fallback supports:
-# {
-#   "value": [...]
-# }
-# ==================================================
-
-if jq -e '.d.results | arrays' \
-  /tmp/cpi-artifacts-response.txt >/dev/null 2>&1; then
-
-  RESPONSE_FORMAT="odata-v2"
-
-elif jq -e '.value | arrays' \
-  /tmp/cpi-artifacts-response.txt >/dev/null 2>&1; then
-
-  RESPONSE_FORMAT="value-array"
-
-else
-  echo "::error::CPI returned HTTP 200, but the expected artifact JSON structure was not found."
-
-  echo
-  echo "Response sample:"
-  head -c 4000 /tmp/cpi-artifacts-response.txt
-  echo
-
-  exit 1
-fi
+TOTAL=$(jq '.d.results | length' "$ALL_ARTIFACTS")
 
 echo
-echo "Detected response format: $RESPONSE_FORMAT"
-
-if [ "$RESPONSE_FORMAT" = "odata-v2" ]; then
-  RETURNED_COUNT=$(jq '.d.results | length' \
-    /tmp/cpi-artifacts-response.txt)
-else
-  RETURNED_COUNT=$(jq '.value | length' \
-    /tmp/cpi-artifacts-response.txt)
-fi
-
-echo "Artifacts returned: $RETURNED_COUNT"
+echo "Total artifacts discovered: $TOTAL"
 
 # ==================================================
-# 6. Find versions marked ReadyForDeployment
-#
-# Supported:
-# 1.0.0.ReadyForDeployment
-# 1.0.10.1.ReadyForDeployment
-# v1.0.0.ReadyForDeployment
-# v1.0.10.1.ReadyForDeployment
-#
-# Not selected:
-# 1.0.0
-# 1.0.ReadyForDeployment
-# ReadyForDeployment
+# 5. Select ReadyForDeployment iFlows
 # ==================================================
 
-READY_FILTER='
-  select(
-    .Id != null
-    and .Version != null
-    and (
-      .Version
-      | test(
-          "^[0-9]+\\.[0-9]+\\.[0-9]+(\\.[0-9]+)?\\.ReadyForDeployment$"
-        )
+SELECTED_FILE="${TEMP_DIR}/selected-iflows.json"
+
+jq \
+  --arg pattern "$VERSION_REGEX" \
+  '
+  [
+    .d.results[]
+    |
+    select(
+      .Id != null
+      and (.Version | type == "string")
+      and (.Version | test($pattern))
     )
-  )
-'
+    |
+    {
+      id: .Id,
+      name: (.Name // .Id),
+      packageId: .PackageId,
+      savedVersion: .Version
+    }
+  ]
+  ' \
+  "$ALL_ARTIFACTS" \
+  > "$SELECTED_FILE"
 
-if [ "$RESPONSE_FORMAT" = "odata-v2" ]; then
-
-  READY_ARTIFACTS=$(jq -c \
-    ".d.results[] | ${READY_FILTER}" \
-    /tmp/cpi-artifacts-response.txt)
-
-else
-
-  READY_ARTIFACTS=$(jq -c \
-    ".value[] | ${READY_FILTER}" \
-    /tmp/cpi-artifacts-response.txt)
-
-fi
-
-READY_COUNT=$(printf '%s\n' "$READY_ARTIFACTS" \
-  | sed '/^[[:space:]]*$/d' \
-  | wc -l \
-  | tr -d ' ')
-*echo
-echo "ReadyForDeployment arti*acts found: $READY_COUNT"
-
-if [ "$READY_COUNT" -eq 0 ]; then
-  echo
- *echo "No artifact version matched *he supported patterns:"
-  echo "x.*.z.ReadyForDeployment"
-  echo "x.y*z.w.ReadyForDeployment"
-  echo "vx*y.z.ReadyForDeployment"
-  echo "vx*y.z.w.ReadyForDeployment"
-  echo
- *echo "Nothing to download."
-
-  exi* 0
-fi
-
-# =========================*========================
-# 7. Crea*e output directory
-# =============*==================================*=
-
-if [ -n "${GITHUB_WORKSPACE:-}" ]; then
-  ARTIFACT_DIR="${GITHUB_W*RKSPACE}/artifacts"
-else
-  ARTIFAC*_DIR="${PWD}/artifacts"
-fi
-
-mkdir *p "$ARTIFACT_DIR"
+MATCHED=$(jq 'length' "$SELECTED_FILE")
 
 echo
-echo "Arti*act output directory:"
-echo "$ARTI*ACT_DIR"
+echo "=================================================="
+echo "ReadyForDeployment Discovery"
+echo "=================================================="
+echo "Matching artifacts: $MATCHED"
 
-# ======================*===========================
-# 8. D*wnload each matching artifact
-# ==*==================================*============
+if [ "$MATCHED" -eq 0 ]; then
+
+  echo
+  echo "No artifacts found matching:"
+  echo "1.2.3.ReadyForDeployment"
+  echo "1.2.3.4.ReadyForDeployment"
+
+  exit 0
+fi
+
+echo
+echo "Selected artifacts:"
+
+jq -r '
+  .[]
+  |
+  "\(.name) | Id=\(.id) | Package=\(.packageId) | Version=\(.savedVersion)"
+' "$SELECTED_FILE"
+
+# ==================================================
+# 6. Download selected iFlows
+# ==================================================
 
 DOWNLOADED_COUNT=0
-F*ILED_COUNT=0
+FAILED_COUNT=0
 
-while IFS= read -r a*tifact; do
+while IFS= read -r item; do
 
-  [ -z "$artifact" ] &* continue
+  IFLOW_ID=$(echo "$item" | jq -r '.id')
+  IFLOW_NAME=$(echo "$item" | jq -r '.name')
+  VERSION=$(echo "$item" | jq -r '.savedVersion')
+  PACKAGE_ID=$(echo "$item" | jq -r '.packageId')
 
-  ID=$(echo "$artifact"*| jq -r '.Id')
-  VERSION=$(echo "$*rtifact" | jq -r '.Version')
-  NAM*=$(echo "$artifact" | jq -r '.Name*// .Id')
-  PACKAGE_ID=$(echo "$art*fact" | jq -r '.PackageId // "unkn*wn"')
+  SAFE_NAME=$(printf '%s' "$IFLOW_NAME" |
+    tr '/' '-')
+
+  TARGET_PATH="${DOWNLOAD_DIR}/${SAFE_NAME}/${VERSION}"
+
+  ZIP_FILE="${TARGET_PATH}/${SAFE_NAME}.zip"
+
+  mkdir -p "$TARGET_PATH"
+
+  ODATA_ID=$(printf '%s' "$IFLOW_ID" |
+    sed "s/'/''/g")
+
+  ODATA_VER=$(printf '%s' "$VERSION" |
+    sed "s/'/''/g")
+
+  URL="${API_BASE}/api/v1/IntegrationDesigntimeArtifacts(Id='${ODATA_ID}',Version='${ODATA_VER}')/\$value"
 
   echo
-  echo "============*==================================*=="
-  echo "ReadyForDeployment art*fact found"
-  echo "==============*==================================*"
-  echo "Name       : $NAME"
-  ec*o "ID         : $ID"
-  echo "Packa*e ID : $PACKAGE_ID"
-  echo "Versio*    : $VERSION"
+  echo "=================================================="
+  echo "Downloading artifact"
+  echo "=================================================="
+  echo "Name    : $IFLOW_NAME"
+  echo "ID      : $IFLOW_ID"
+  echo "Package : $PACKAGE_ID"
+  echo "Version : $VERSION"
 
-  # Escape single*quotes for OData key values
-  SAFE*ID="${ID//\'/\'\'}"
-  SAFE_VERSION*"${VERSION//\'/\'\'}"
-
-  # Sanitiz* values used in the output filenam*
-  SAFE_FILE_ID=$(printf '%s' "$ID* \
-    | sed 's/[^A-Za-z0-9._-]/_/*')
-
-  SAFE_FILE_VERSION=$(printf '*s' "$VERSION" \
-    | sed 's/[^A-Za-z0-9._-]/_/g')
-
-  OUTPUT_FILE="${*RTIFACT_DIR}/${SAFE_FILE_ID}_${SAF*_FILE_VERSION}.zip"
-
-  DOWNLOAD_UR*="${BASE_URL}/api/v1/IntegrationDe*igntimeArtifacts(Id='${SAFE_ID}',V*rsion='${SAFE_VERSION}')/\$value"
-*  echo
-  echo "Downloading artifac*..."
-  echo "Output file: $OUTPUT_*ILE"
-
-  DOWNLOAD_HTTP_CODE=$(curl *
+  HTTP_CODE=$(curl \
     --silent \
-    --show-error \*    --location \
-    --request GET*\
-    --output "$OUTPUT_FILE" \
-  * --write-out "%{http_code}" \
-    *-header "Authorization: Bearer ${A*CESS_TOKEN}" \
-    --header "Accep*: application/octet-stream" \
-    *$DOWNLOAD_URL")
+    --show-error \
+    --connect-timeout 10 \
+    --max-time 90 \
+    --location \
+    --write-out "%{http_code}" \
+    --request GET \
+    "$URL" \
+    --header "Authorization: Bearer ${SAP_ACCESS_TOKEN}" \
+    --header "Accept: application/zip" \
+    --output "$ZIP_FILE")
 
-  echo "Download *TTP status: $DOWNLOAD_HTTP_CODE"
+  echo "Download HTTP status: $HTTP_CODE"
 
-* if [ "$DOWNLOAD_HTTP_CODE" != "200" ]; then
-    echo "::error::Downl*ad failed for artifact $ID."
-    e*ho "HTTP status: $DOWNLOAD_HTTP_CO*E"
+  if [ "$HTTP_CODE" != "200" ]; then
 
-    if [ -s "$OUTPUT_FILE" ]; *hen
-      echo
-      echo "SAP res*onse:"
-      cat "$OUTPUT_FILE" ||*true
-      echo
-    fi
+    echo "::error::Download failed for $IFLOW_ID"
 
-    rm -f *$OUTPUT_FILE"
-
-    FAILED_COUNT=$(*FAILED_COUNT + 1))
-    continue
-  *i
-
-  if [ ! -s "$OUTPUT_FILE" ]; t*en
-    echo "::error::Downloaded f*le is empty for artifact $ID."
-
-  * rm -f "$OUTPUT_FILE"
-
-    FAILED_*OUNT=$((FAILED_COUNT + 1))
-    con*inue
-  fi
-
-  echo "Validating down*oaded ZIP..."
-
-  if ! unzip -t "$OUTPUT_FILE" >/dev/null 2>&1; then
-    echo "::error::Downloaded content is not a valid ZIP for artifact $ID."
-
-    rm -f "$OUTPUT_FILE"
+    rm -f "$ZIP_FILE"
 
     FAILED_COUNT=$((FAILED_COUNT + 1))
+
     continue
   fi
 
-  FILE_SIZE=$(du -h "$OUTPUT_FILE" | awk '{print $1}')
+  if [ ! -s "$ZIP_FILE" ]; then
 
-  echo "Download successful."
-  echo "File size: $FILE_SIZE"
+    echo "::error::Downloaded ZIP is empty for $IFLOW_ID"
+
+    rm -f "$ZIP_FILE"
+
+    FAILED_COUNT=$((FAILED_COUNT + 1))
+
+    continue
+  fi
+
+  echo "Validating ZIP..."
+
+  if ! unzip -tq "$ZIP_FILE" >/dev/null 2>&1; then
+
+    echo "::error::Invalid ZIP downloaded for $IFLOW_ID"
+
+    rm -f "$ZIP_FILE"
+
+    FAILED_COUNT=$((FAILED_COUNT + 1))
+
+    continue
+  fi
+
+  echo "Downloaded successfully:"
+  echo "$ZIP_FILE"
 
   DOWNLOADED_COUNT=$((DOWNLOADED_COUNT + 1))
 
-done <<< "$READY_ARTIFACTS"
+done < <(jq -c '.[]' "$SELECTED_FILE")
 
 # ==================================================
-# 9. Final verification
+# 7. Final summary
 # ==================================================
 
 echo
 echo "=================================================="
 echo "DOWNLOAD SUMMARY"
 echo "=================================================="
-echo "CPI artifacts returned       : $RETURNED_COUNT"
-echo "ReadyForDeployment artifacts : $READY_COUNT"
-echo "Successfully downloaded      : $DOWNLOADED_COUNT"
-echo "Failed downloads             : $FAILED_COUNT"
-echo "Output directory             : $ARTIFACT_DIR"
+
+echo "Packages discovered        : $PACKAGE_COUNT"
+echo "Artifacts discovered       : $TOTAL"
+echo "ReadyForDeployment         : $MATCHED"
+echo "Downloaded successfully    : $DOWNLOADED_COUNT"
+echo "Failed                     : $FAILED_COUNT"
 
 echo
 echo "Downloaded ZIP files:"
 
-find "$ARTIFACT_DIR" \
-  -maxdepth 1 \
+find "$DOWNLOAD_DIR" \
   -type f \
-  -name "*.zip" \
+  -name '*.zip' \
   -print
 
 if [ "$FAILED_COUNT" -gt 0 ]; then
@@ -421,7 +370,7 @@ if [ "$FAILED_COUNT" -gt 0 ]; then
 fi
 
 if [ "$DOWNLOADED_COUNT" -eq 0 ]; then
-  echo "::error::ReadyForDeployment artifacts were found, but no ZIP file was downloaded successfully."
+  echo "::error::No ReadyForDeployment artifacts were downloaded."
   exit 1
 fi
 
