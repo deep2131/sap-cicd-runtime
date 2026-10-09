@@ -104,7 +104,7 @@ echo "OAuth token generated successfully."
 echo
 echo "Reading CPI design-time artifacts..."
 
-API_URL="${BASE_URL}/api/v1/IntegrationDesigntimeArtifacts?\$format=json"
+API_URL="${BASE_URL}/api/v1/\$metadata"
 
 echo
 echo "CPI API URL:"
