@@ -41,7 +41,7 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ steps.repo.outputs.name }}:1.4
+            ghcr.io/${{ steps.repo.outputs.name }}:1.5
             ghcr.io/${{ steps.repo.outputs.name }}:latest
 
       - name: Summary
